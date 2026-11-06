@@ -1,0 +1,13 @@
+version: '3'
+services:
+  dionaea:
+    image: dinotools/dionaea
+    container_name: dionaea
+    ports:
+      - "21:21"
+      - "4445:445"
+      - "3306:3306"
+    volumes:
+      - ./var/log/dionaea:/opt/dionaea/var/log/dionaea
+      - ./var/lib/dionaea:/opt/dionaea/var/lib/dionaea
+    restart: always

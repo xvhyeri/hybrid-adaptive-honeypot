@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  # --- ELASTICSEARCH ---
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    restart: always
+
+  # --- LOGSTASH ---
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.12.0
+    container_name: logstash
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./logstash/certs:/usr/share/logstash/certs:ro
+    ports:
+      - "5044:5044"
+    depends_on:
+      - elasticsearch
+    restart: always
+
+  # --- KIBANA ---
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.12.0
+    container_name: kibana
+    ports:
+      - "5601:5601"
+    volumes:
+      - kibana_data:/usr/share/kibana/data
+    depends_on:
+      - elasticsearch
+    restart: always
+
+  # --- FILEBEAT ---
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.12.0
+    container_name: filebeat
+    user: root
+    volumes:
+      # Config
+      - /home/xvhyeri/elk-honeypot/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - ~/honeypot-lab/certs/ca.crt:/etc/filebeat/certs/ca.crt:ro
+      # Cowrie Logs
+      - /home/xvhyeri/honeypot-lab/var/log/cowrie:/var/log/cowrie:ro
+      - /home/xvhyeri/honeypot-lab/cowrie-honeypot/var/log/cowrie:/var/log/cowrie:ro
+      # Dionaea Logs
+      - /home/xvhyeri/honeypot-lab/dionaea/var/log/dionaea:/var/log/dionaea:ro
+      # Conpot Logs (NEW)
+      - /home/xvhyeri/honeypot-lab/modular-honeynet/conpot/logs:/var/log/conpot:ro
+      # Honeytrap Logs (NEW)
+      - /home/xvhyeri/honeypot-lab/modular-honeynet/logs/honeytrap:/var/log/honeytrap:ro
+    depends_on:
+      - logstash
+    restart: always
+
+# --- GLOBAL VOLUMES ---
+volumes:
+  es_data:
+  kibana_data:

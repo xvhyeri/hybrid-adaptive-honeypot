@@ -1,0 +1,1090 @@
+import json
+import os
+import random
+import socket
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import docker
+import joblib
+import pandas as pd
+import requests
+from docker.errors import DockerException, NotFound
+=
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BASE_PATH = Path("/home/xvhyeri/honeypot-lab")
+
+MODEL_PATH = BASE_PATH / "mtd_brain.joblib"
+
+COWRIE_CONTAINER_NAME = "cowrie"
+
+COWRIE_LOG = (
+    BASE_PATH
+    / "cowrie-honeypot"
+    / "var"
+    / "log"
+    / "cowrie"
+    / "cowrie.json"
+)
+
+# Host-side paths used in docker-compose.yml.
+COWRIE_LOG_DIRECTORY = (
+    BASE_PATH
+    / "cowrie-honeypot"
+    / "var"
+    / "log"
+    / "cowrie"
+)
+
+COWRIE_USERDB_FILE = (
+    BASE_PATH
+    / "cowrie-honeypot"
+    / "etc"
+    / "userdb.txt"
+)
+
+# Cowrie ports inside the container.
+COWRIE_INTERNAL_SSH = "2222/tcp"
+COWRIE_INTERNAL_TELNET = "2223/tcp"
+
+# Initial/default host ports.
+DEFAULT_COWRIE_SSH_PORT = 2223
+DEFAULT_COWRIE_TELNET_PORT = 2224
+
+# Randomized SSH port range.
+COWRIE_PORT_MIN = 20000
+COWRIE_PORT_MAX = 29999
+
+# Detection settings.
+MIN_HUMAN_CONFIDENCE = 0.60
+MIN_COMMANDS_FOR_FALLBACK = 4
+
+# Per-attacker cooldown.
+COOLDOWN_SECONDS = 30
+COOLDOWN_NOTICE_INTERVAL = 5
+
+# Cowrie startup validation.
+COWRIE_STARTUP_TIMEOUT = 45
+
+# Elasticsearch audit endpoint.
+ELASTICSEARCH_AUDIT_URL = (
+    "http://127.0.0.1:9200/"
+    "honeypot-admin-actions/_doc"
+)
+
+
+# ============================================================
+# INITIALIZATION
+# ============================================================
+
+try:
+    docker_client = docker.from_env()
+    docker_client.ping()
+
+except DockerException as error:
+    raise SystemExit(
+        f"[FATAL] Unable to connect to Docker: {error}"
+    ) from error
+
+
+if not MODEL_PATH.exists():
+    raise SystemExit(
+        f"[FATAL] ML model not found: {MODEL_PATH}"
+    )
+
+
+try:
+    model = joblib.load(MODEL_PATH)
+
+except Exception as error:
+    raise SystemExit(
+        f"[FATAL] Failed to load ML model: {error}"
+    ) from error
+
+
+CURRENT_COWRIE_SSH_PORT = DEFAULT_COWRIE_SSH_PORT
+CURRENT_COWRIE_TELNET_PORT = DEFAULT_COWRIE_TELNET_PORT
+
+
+# ============================================================
+# NETWORK HELPERS
+# ============================================================
+
+def get_host_ip() -> str:
+    """Returns the primary IPv4 address of the Ubuntu/WSL host."""
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_DGRAM,
+    )
+
+    try:
+        sock.connect(("8.8.8.8", 1))
+        return str(sock.getsockname()[0])
+
+    except OSError:
+        return "127.0.0.1"
+
+    finally:
+        sock.close()
+
+
+def is_port_available(port: int) -> bool:
+    """Returns True if the requested host TCP port is unused."""
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+    )
+
+    try:
+        sock.bind(("0.0.0.0", port))
+        return True
+
+    except OSError:
+        return False
+
+    finally:
+        sock.close()
+
+
+def generate_available_cowrie_port(
+    current_ssh_port: int,
+    telnet_port: int,
+) -> int:
+    """Generates an unused random port for Cowrie SSH."""
+    for _ in range(100):
+        candidate = random.randint(
+            COWRIE_PORT_MIN,
+            COWRIE_PORT_MAX,
+        )
+
+        if candidate in {
+            current_ssh_port,
+            telnet_port,
+        }:
+            continue
+
+        if is_port_available(candidate):
+            return candidate
+
+    raise RuntimeError(
+        "Unable to find an available Cowrie SSH port."
+    )
+
+
+def wait_for_cowrie_port(
+    port: int,
+    timeout: int = COWRIE_STARTUP_TIMEOUT,
+) -> bool:
+    """
+    Waits until Cowrie accepts TCP connections through both
+    localhost and the active host IP address.
+    """
+    host_ip = get_host_ip()
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        localhost_ready = False
+        host_ip_ready = False
+
+        for target_ip in ("127.0.0.1", host_ip):
+            sock = socket.socket(
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+            )
+            sock.settimeout(1)
+
+            try:
+                result = sock.connect_ex(
+                    (target_ip, port)
+                )
+
+                if target_ip == "127.0.0.1":
+                    localhost_ready = result == 0
+                else:
+                    host_ip_ready = result == 0
+
+            finally:
+                sock.close()
+
+        if localhost_ready and host_ip_ready:
+            return True
+
+        time.sleep(1)
+
+    return False
+
+
+# ============================================================
+# DOCKER HELPERS
+# ============================================================
+
+def get_published_port(
+    container: Any,
+    internal_port: str,
+    default_port: int,
+) -> int:
+    """Reads the current host port assigned to a container port."""
+    container.reload()
+
+    ports = (
+        container.attrs
+        .get("NetworkSettings", {})
+        .get("Ports", {})
+    )
+
+    bindings = ports.get(internal_port)
+
+    if not bindings:
+        return default_port
+
+    host_port = bindings[0].get("HostPort")
+
+    try:
+        return int(host_port)
+
+    except (TypeError, ValueError):
+        return default_port
+
+
+def get_attached_networks(
+    container: Any,
+) -> list[str]:
+    """Returns Docker networks attached to Cowrie."""
+    network_data = (
+        container.attrs
+        .get("NetworkSettings", {})
+        .get("Networks", {})
+    )
+
+    return list(network_data.keys())
+
+
+def build_cowrie_volumes() -> dict[str, dict[str, str]]:
+    """
+    Returns only the explicit bind mounts from docker-compose.yml.
+
+    Anonymous and Docker-managed volumes are not copied because
+    they can hide Cowrie's built-in honeyfs files.
+    """
+    if not COWRIE_LOG_DIRECTORY.exists():
+        raise FileNotFoundError(
+            f"Cowrie log directory does not exist: "
+            f"{COWRIE_LOG_DIRECTORY}"
+        )
+
+    if not COWRIE_USERDB_FILE.exists():
+        raise FileNotFoundError(
+            f"Cowrie userdb file does not exist: "
+            f"{COWRIE_USERDB_FILE}"
+        )
+
+    return {
+        str(COWRIE_LOG_DIRECTORY): {
+            "bind": (
+                "/cowrie/cowrie-git/"
+                "var/log/cowrie"
+            ),
+            "mode": "rw",
+        },
+        str(COWRIE_USERDB_FILE): {
+            "bind": (
+                "/cowrie/cowrie-git/"
+                "data/userdb.txt"
+            ),
+            "mode": "rw",
+        },
+    }
+
+
+# ============================================================
+# ELASTICSEARCH AUDIT LOGGING
+# ============================================================
+
+def record_cowrie_mtd_event(
+    source_ip: str,
+    old_port: int,
+    new_port: int | None,
+    status: str,
+    trigger_reason: str,
+    human_confidence: float,
+    command_count: int,
+    error_message: str | None = None,
+) -> None:
+    """Records the Cowrie MTD action in Elasticsearch."""
+    payload: dict[str, Any] = {
+        "event_type": "MTD_COWRIE_PORT_MUTATION",
+        "requested_by": (
+            "Hybrid Random Forest MTD Engine"
+        ),
+        "service": "cowrie",
+        "protocol": "SSH",
+        "source_ip": source_ip,
+        "old_port": old_port,
+        "new_port": new_port,
+        "trigger_reason": trigger_reason,
+        "human_confidence": human_confidence,
+        "command_count": command_count,
+        "mtd_triggered": status == "SUCCESS",
+        "status": status,
+        "@timestamp": (
+            datetime.now(UTC)
+            .isoformat()
+            .replace("+00:00", "Z")
+        ),
+    }
+
+    if error_message:
+        payload["error_message"] = error_message
+
+    try:
+        response = requests.post(
+            ELASTICSEARCH_AUDIT_URL,
+            json=payload,
+            timeout=5,
+        )
+
+        response.raise_for_status()
+
+        print(
+            "[INFO] Cowrie MTD event recorded "
+            "in Elasticsearch."
+        )
+
+    except requests.RequestException as error:
+        print(
+            "[WARNING] Failed to record MTD event "
+            f"in Elasticsearch: {error}"
+        )
+
+
+# ============================================================
+# MACHINE LEARNING
+# ============================================================
+
+def get_human_probability(
+    features: pd.DataFrame,
+) -> float:
+    """
+    Returns the probability for class 1.
+
+    Class 0 = Bot
+    Class 1 = Interactive human
+    """
+    if not hasattr(model, "predict_proba"):
+        prediction = int(
+            model.predict(features)[0]
+        )
+
+        return 1.0 if prediction == 1 else 0.0
+
+    probabilities = model.predict_proba(features)[0]
+    classes = list(model.classes_)
+
+    if 1 not in classes:
+        return 0.0
+
+    human_class_index = classes.index(1)
+
+    return float(
+        probabilities[human_class_index]
+    )
+
+
+def classify_session(
+    hits: int,
+    unique_users: int,
+    commands: int,
+) -> tuple[int, float]:
+    """Classifies one attacker session."""
+    features = pd.DataFrame(
+        [[hits, unique_users, commands]],
+        columns=[
+            "hits",
+            "users",
+            "cmds",
+        ],
+    )
+
+    prediction = int(
+        model.predict(features)[0]
+    )
+
+    human_probability = get_human_probability(
+        features
+    )
+
+    # Sessions without commands are not interactive.
+    if commands == 0:
+        prediction = 0
+        human_probability = 0.0
+
+    return prediction, human_probability
+
+
+# ============================================================
+# COWRIE MTD FUNCTION
+# ============================================================
+
+def trigger_cowrie_port_hop(
+    source_ip: str = "unknown",
+    trigger_reason: str = "unknown",
+    human_confidence: float = 0.0,
+    command_count: int = 0,
+) -> bool:
+    """
+    Recreates Cowrie with a randomized SSH host port.
+
+    Cowrie internal SSH remains 2222.
+    Cowrie internal Telnet remains 2223.
+    Telnet host port remains unchanged.
+    """
+    global CURRENT_COWRIE_SSH_PORT
+    global CURRENT_COWRIE_TELNET_PORT
+
+    old_port = CURRENT_COWRIE_SSH_PORT
+    new_port: int | None = None
+
+    try:
+        container = docker_client.containers.get(
+            COWRIE_CONTAINER_NAME
+        )
+
+        container.reload()
+
+        old_port = get_published_port(
+            container,
+            COWRIE_INTERNAL_SSH,
+            CURRENT_COWRIE_SSH_PORT,
+        )
+
+        telnet_port = get_published_port(
+            container,
+            COWRIE_INTERNAL_TELNET,
+            CURRENT_COWRIE_TELNET_PORT,
+        )
+
+        CURRENT_COWRIE_SSH_PORT = old_port
+        CURRENT_COWRIE_TELNET_PORT = telnet_port
+
+        new_port = generate_available_cowrie_port(
+            current_ssh_port=old_port,
+            telnet_port=telnet_port,
+        )
+
+        host_ip = get_host_ip()
+
+        config = container.attrs.get(
+            "Config",
+            {},
+        )
+
+        host_config = container.attrs.get(
+            "HostConfig",
+            {},
+        )
+
+        image = (
+            config.get("Image")
+            or "cowrie/cowrie"
+        )
+
+        environment = (
+            config.get("Env")
+            or [
+                "COWRIE_OUTPUT_JSONLOG_ENABLED=true"
+            ]
+        )
+
+        labels = config.get("Labels") or {}
+
+        restart_policy = (
+            host_config.get("RestartPolicy")
+            or {
+                "Name": "unless-stopped",
+            }
+        )
+
+        volumes = build_cowrie_volumes()
+
+        attached_networks = get_attached_networks(
+            container
+        )
+
+        primary_network = (
+            attached_networks[0]
+            if attached_networks
+            else None
+        )
+
+        print()
+        print("=" * 68)
+        print(
+            "[!!!] COWRIE MOVING TARGET DEFENSE ACTIVATED"
+        )
+        print(f"[MTD] Attacker IP     : {source_ip}")
+        print(f"[MTD] Trigger reason  : {trigger_reason}")
+        print(
+            f"[MTD] Human confidence: "
+            f"{human_confidence:.2%}"
+        )
+        print(f"[MTD] Commands        : {command_count}")
+        print(f"[MTD] Old SSH port    : {old_port}")
+        print(f"[MTD] New SSH port    : {new_port}")
+        print(f"[MTD] Telnet port     : {telnet_port}")
+        print("=" * 68)
+
+        run_arguments: dict[str, Any] = {
+            "image": image,
+            "name": COWRIE_CONTAINER_NAME,
+            "detach": True,
+            "ports": {
+                COWRIE_INTERNAL_SSH: (
+                    "0.0.0.0",
+                    new_port,
+                ),
+                COWRIE_INTERNAL_TELNET: (
+                    "0.0.0.0",
+                    telnet_port,
+                ),
+            },
+            "volumes": volumes,
+            "environment": environment,
+            "restart_policy": restart_policy,
+            "labels": labels,
+        }
+
+        if primary_network:
+            run_arguments["network"] = (
+                primary_network
+            )
+
+        print(
+            "[INFO] Removing the current "
+            "Cowrie container..."
+        )
+
+        container.remove(force=True)
+
+        time.sleep(2)
+
+        print(
+            f"[INFO] Recreating Cowrie with "
+            f"SSH host port {new_port}..."
+        )
+
+        new_container = (
+            docker_client.containers.run(
+                **run_arguments
+            )
+        )
+
+        # Reconnect additional Docker networks.
+        for network_name in attached_networks[1:]:
+            try:
+                network = (
+                    docker_client.networks.get(
+                        network_name
+                    )
+                )
+
+                network.connect(new_container)
+
+            except DockerException as error:
+                print(
+                    "[WARNING] Could not reconnect "
+                    f"Cowrie to network "
+                    f"{network_name}: {error}"
+                )
+
+        print(
+            "[INFO] Waiting for Cowrie "
+            "to initialize..."
+        )
+
+        if not wait_for_cowrie_port(
+            port=new_port,
+            timeout=COWRIE_STARTUP_TIMEOUT,
+        ):
+            try:
+                container_logs = (
+                    new_container.logs(
+                        tail=50
+                    )
+                    .decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                )
+
+            except Exception:
+                container_logs = (
+                    "Unable to retrieve "
+                    "Cowrie container logs."
+                )
+
+            raise RuntimeError(
+                f"Cowrie did not become ready on "
+                f"port {new_port}.\n"
+                f"Container logs:\n"
+                f"{container_logs}"
+            )
+
+        new_container.reload()
+
+        if new_container.status != "running":
+            raise RuntimeError(
+                f"Cowrie container status is "
+                f"'{new_container.status}'."
+            )
+
+        CURRENT_COWRIE_SSH_PORT = new_port
+        CURRENT_COWRIE_TELNET_PORT = telnet_port
+
+        print(
+            f"[SUCCESS] Cowrie SSH moved from "
+            f"{host_ip}:{old_port} to "
+            f"{host_ip}:{new_port}."
+        )
+
+        print(
+            f"[SUCCESS] Cowrie Telnet remains "
+            f"on host port {telnet_port}."
+        )
+
+        record_cowrie_mtd_event(
+            source_ip=source_ip,
+            old_port=old_port,
+            new_port=new_port,
+            status="SUCCESS",
+            trigger_reason=trigger_reason,
+            human_confidence=human_confidence,
+            command_count=command_count,
+        )
+
+        return True
+
+    except NotFound:
+        error_message = (
+            f"Cowrie container "
+            f"'{COWRIE_CONTAINER_NAME}' "
+            "was not found."
+        )
+
+    except DockerException as error:
+        error_message = (
+            f"Docker error: {error}"
+        )
+
+    except Exception as error:
+        error_message = (
+            f"{type(error).__name__}: {error}"
+        )
+
+    print(
+        f"[ERROR] Cowrie MTD failed: "
+        f"{error_message}"
+    )
+
+    record_cowrie_mtd_event(
+        source_ip=source_ip,
+        old_port=old_port,
+        new_port=new_port,
+        status="FAILED",
+        trigger_reason=trigger_reason,
+        human_confidence=human_confidence,
+        command_count=command_count,
+        error_message=error_message,
+    )
+
+    return False
+
+
+# ============================================================
+# MONITORING LOOP
+# ============================================================
+
+def run_intelligent_loop() -> None:
+    """
+    Monitors Cowrie JSON logs and activates MTD when interactive
+    human-like behaviour is detected.
+    """
+    print("=" * 68)
+    print(
+        " INTELLIGENT COWRIE MTD ORCHESTRATOR"
+    )
+    print(
+        " RANDOM FOREST + BEHAVIOURAL FALLBACK"
+    )
+    print("=" * 68)
+
+    print(f"[CONFIG] Cowrie log: {COWRIE_LOG}")
+    print(f"[CONFIG] ML model: {MODEL_PATH}")
+
+    print(
+        f"[CONFIG] ML confidence threshold: "
+        f"{MIN_HUMAN_CONFIDENCE:.0%}"
+    )
+
+    print(
+        f"[CONFIG] Command fallback threshold: "
+        f"{MIN_COMMANDS_FOR_FALLBACK}"
+    )
+
+    session_data: dict[
+        str,
+        dict[str, Any],
+    ] = {}
+
+    last_heartbeat = time.time()
+    first_log_open = True
+
+    while True:
+        if not COWRIE_LOG.exists():
+            print(
+                f"[WAITING] Cowrie log not found: "
+                f"{COWRIE_LOG}"
+            )
+
+            time.sleep(2)
+            continue
+
+        try:
+            with COWRIE_LOG.open(
+                "r",
+                encoding="utf-8",
+                errors="replace",
+            ) as log_file:
+
+                # Ignore previous events only at initial startup.
+                if first_log_open:
+                    log_file.seek(
+                        0,
+                        os.SEEK_END,
+                    )
+
+                    first_log_open = False
+
+                print()
+                print(
+                    "[SYSTEM] Sensors online and "
+                    "monitoring Cowrie events."
+                )
+
+                restart_log_reader = False
+
+                while not restart_log_reader:
+                    current_clock = time.time()
+
+                    if (
+                        current_clock
+                        - last_heartbeat
+                        >= 5
+                    ):
+                        print(
+                            "[HEARTBEAT] MTD engine is "
+                            "actively listening..."
+                        )
+
+                        last_heartbeat = current_clock
+
+                    line = log_file.readline()
+
+                    if not line:
+                        time.sleep(0.2)
+                        continue
+
+                    try:
+                        event = json.loads(line)
+
+                    except json.JSONDecodeError as error:
+                        print(
+                            "[WARNING] Invalid Cowrie "
+                            f"JSON event: {error}"
+                        )
+                        continue
+
+                    try:
+                        event_id = event.get(
+                            "eventid",
+                            "",
+                        )
+
+                        relevant_events = {
+                            "cowrie.login.failed",
+                            "cowrie.login.success",
+                            "cowrie.command.input",
+                        }
+
+                        if event_id not in relevant_events:
+                            continue
+
+                        source_ip = event.get(
+                            "src_ip",
+                            "unknown",
+                        )
+
+                        current_time = time.time()
+
+                        if source_ip not in session_data:
+                            session_data[source_ip] = {
+                                "hits": 0,
+                                "users": set(),
+                                "cmds": 0,
+                                "last_hop_time": 0.0,
+                                "last_cooldown_notice": 0.0,
+                            }
+
+                        attacker = session_data[
+                            source_ip
+                        ]
+
+                        time_since_last_hop = (
+                            current_time
+                            - attacker[
+                                "last_hop_time"
+                            ]
+                        )
+
+                        if (
+                            time_since_last_hop
+                            < COOLDOWN_SECONDS
+                        ):
+                            remaining = max(
+                                0,
+                                int(
+                                    COOLDOWN_SECONDS
+                                    - time_since_last_hop
+                                ),
+                            )
+
+                            last_notice = attacker.get(
+                                "last_cooldown_notice",
+                                0.0,
+                            )
+
+                            if (
+                                current_time
+                                - last_notice
+                                >= COOLDOWN_NOTICE_INTERVAL
+                            ):
+                                print(
+                                    "[COOLDOWN] Events from "
+                                    f"{source_ip} are ignored. "
+                                    f"{remaining}s remaining."
+                                )
+
+                                attacker[
+                                    "last_cooldown_notice"
+                                ] = current_time
+
+                            continue
+
+                        if event_id in {
+                            "cowrie.login.failed",
+                            "cowrie.login.success",
+                        }:
+                            attacker["hits"] += 1
+
+                            username = event.get(
+                                "username",
+                                "unknown",
+                            )
+
+                            attacker["users"].add(
+                                username
+                            )
+
+                        elif (
+                            event_id
+                            == "cowrie.command.input"
+                        ):
+                            attacker["cmds"] += 1
+
+                        hits = int(
+                            attacker["hits"]
+                        )
+
+                        unique_users = len(
+                            attacker["users"]
+                        )
+
+                        commands = int(
+                            attacker["cmds"]
+                        )
+
+                        (
+                            prediction,
+                            human_probability,
+                        ) = classify_session(
+                            hits=hits,
+                            unique_users=unique_users,
+                            commands=commands,
+                        )
+
+                        bot_probability = max(
+                            0.0,
+                            1.0 - human_probability,
+                        )
+
+                        print(
+                            f"[ML] IP={source_ip} | "
+                            f"Event={event_id} | "
+                            f"Hits={hits} | "
+                            f"Users={unique_users} | "
+                            f"Cmds={commands} | "
+                            f"Bot={bot_probability:.2%} | "
+                            f"Human="
+                            f"{human_probability:.2%} | "
+                            f"Prediction={prediction}"
+                        )
+
+                        ml_trigger = (
+                            prediction == 1
+                            and human_probability
+                            >= MIN_HUMAN_CONFIDENCE
+                            and commands >= 1
+                        )
+
+                        behavioural_trigger = (
+                            hits >= 1
+                            and commands
+                            >= MIN_COMMANDS_FOR_FALLBACK
+                        )
+
+                        should_trigger_mtd = (
+                            ml_trigger
+                            or behavioural_trigger
+                        )
+
+                        if not should_trigger_mtd:
+                            print(
+                                f"[MONITORING] {source_ip} "
+                                "has not reached the "
+                                "MTD threshold."
+                            )
+
+                            continue
+
+                        if ml_trigger:
+                            trigger_reason = (
+                                "Random Forest human "
+                                "classification"
+                            )
+
+                        else:
+                            trigger_reason = (
+                                "interactive command "
+                                "threshold"
+                            )
+
+                        print()
+                        print(
+                            "[!] HUMAN-LIKE BEHAVIOUR "
+                            "DETECTED"
+                        )
+
+                        print(
+                            f"[!] IP: {source_ip}"
+                        )
+
+                        print(
+                            f"[!] Reason: "
+                            f"{trigger_reason}"
+                        )
+
+                        print(
+                            f"[!] Commands: {commands}"
+                        )
+
+                        print(
+                            f"[!] Human confidence: "
+                            f"{human_probability:.2%}"
+                        )
+
+                        success = trigger_cowrie_port_hop(
+                            source_ip=source_ip,
+                            trigger_reason=trigger_reason,
+                            human_confidence=(
+                                human_probability
+                            ),
+                            command_count=commands,
+                        )
+
+                        if success:
+                            attacker["hits"] = 0
+                            attacker["users"] = set()
+                            attacker["cmds"] = 0
+                            attacker["last_hop_time"] = (
+                                time.time()
+                            )
+                            attacker[
+                                "last_cooldown_notice"
+                            ] = 0.0
+
+                            print(
+                                "[INFO] Cowrie port hop "
+                                "completed."
+                            )
+
+                            print(
+                                f"[INFO] Cooldown enabled "
+                                f"for {source_ip}."
+                            )
+
+                            # Cowrie was recreated, so reopen
+                            # the log file using a new handle.
+                            restart_log_reader = True
+
+                    except Exception as error:
+                        print(
+                            "[ERROR] Event processing "
+                            f"failed: "
+                            f"{type(error).__name__}: "
+                            f"{error}"
+                        )
+
+        except FileNotFoundError:
+            print(
+                "[WARNING] Cowrie log disappeared. "
+                "Waiting for it to return..."
+            )
+
+            time.sleep(2)
+
+        except PermissionError as error:
+            print(
+                "[ERROR] Permission denied while "
+                f"reading Cowrie log: {error}"
+            )
+
+            time.sleep(5)
+
+        except KeyboardInterrupt:
+            print()
+            print(
+                "[SYSTEM] MTD orchestrator stopped "
+                "by the user."
+            )
+            break
+
+        except Exception as error:
+            print(
+                "[ERROR] Log monitoring failed: "
+                f"{type(error).__name__}: {error}"
+            )
+
+            time.sleep(2)
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    run_intelligent_loop()

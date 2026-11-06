@@ -1,0 +1,43 @@
+{
+    "model": "RandomForestClassifier",
+    "class_definition": {
+        "0": "Automated/Bot",
+        "1": "Interactive Human/High Risk"
+    },
+    "dataset": {
+        "total_records": 1000,
+        "training_records": 800,
+        "testing_records": 200,
+        "class_0_records": 500,
+        "class_1_records": 500
+    },
+    "performance": {
+        "accuracy": 76.0,
+        "precision": 75.49,
+        "recall": 77.0,
+        "f1_score": 76.24
+    },
+    "confusion_matrix": {
+        "true_negative": 75,
+        "false_positive": 25,
+        "false_negative": 23,
+        "true_positive": 77
+    },
+    "feature_importance": {
+        "hits": 38.48,
+        "cmds": 37.31,
+        "users": 24.2
+    },
+    "configuration": {
+        "features": [
+            "hits",
+            "users",
+            "cmds"
+        ],
+        "target": "is_danger",
+        "test_size": 0.2,
+        "random_state": 42,
+        "n_estimators": 100,
+        "class_weight": "balanced"
+    }
+}

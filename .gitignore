@@ -1,0 +1,55 @@
+# Python virtual environments
+**/venv/
+**/.venv/
+**/__pycache__/
+**/*.pyc
+
+# Secrets and environment variables
+**/.env
+**/.env.*
+!**/.env.example
+**/*serviceAccount*.json
+**/firebase-adminsdk*.json
+
+# Private certificates and keys
+**/certs/
+**/*.key
+**/*.p12
+**/*.pfx
+
+# Generated logs and temporary files
+**/*.log
+**/logs/
+**/tmp/
+**/temp/
+
+# Filebeat internal state
+**/filebeat_data/
+
+# Docker generated volumes and data
+**/docker-data/
+**/elasticsearch-data/
+**/volumes/
+
+# Flutter generated files
+**/.dart_tool/
+**/build/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+
+# OS files
+.DS_Store
+Thumbs.db
+# Honeypot runtime data
+**/var/
+**/filebeat_data/
+**/*.sqlite
+**/cowrie.json*
+
+# SSH host keys
+**/ssh_host_*_key
+**/ssh_host_*_key.pub
+
+# Cowrie credentials
+**/userdb.txt
+**/*.pem

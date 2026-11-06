@@ -1,0 +1,17 @@
+services:
+  cowrie:
+    image: cowrie/cowrie
+    container_name: cowrie
+
+    ports:
+      - "2223:2222"
+      - "2224:2223"
+
+    restart: unless-stopped
+
+    environment:
+      - COWRIE_OUTPUT_JSONLOG_ENABLED=true
+
+    volumes:
+      - ./var/log/cowrie:/cowrie/cowrie-git/var/log/cowrie
+      - ./etc/userdb.txt:/cowrie/cowrie-git/data/userdb.txt

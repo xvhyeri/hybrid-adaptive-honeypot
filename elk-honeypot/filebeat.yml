@@ -1,0 +1,65 @@
+filebeat.inputs:
+  # --- Cowrie SSH Honeypot (JSON) ---
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/cowrie/cowrie.json
+    json.keys_under_root: true
+    json.overwrite_keys: true
+    fields:
+      honeypot_type: "cowrie"
+    fields_under_root: true
+
+  # --- Dionaea Malware Honeypot (TEXT) ---
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/dionaea/dionaea.log
+    fields:
+      honeypot_type: "dionaea"
+    fields_under_root: true
+
+  # --- Conpot ICS Honeypot ---
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/conpot/conpot.json
+    json.keys_under_root: true
+    json.overwrite_keys: true
+    fields:
+      honeypot_type: "conpot"
+    fields_under_root: true
+
+  # --- Honeytrap Director (JSON/TEXT) ---
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/honeytrap/honeytrap.log
+    fields:
+      honeypot_type: "honeytrap"
+    fields_under_root: true
+
+  # --- PyRDP (RDP Honeypot - TEXT) ---
+  - type: filestream
+    id: pyrdp-honeypot
+    enabled: true
+    paths:
+      - /var/log/pyrdp/*.log
+    fields:
+      honeypot_type: "pyrdp"
+    fields_under_root: true
+
+# --- Global Output (MUST NOT BE INDENTED) ---
+output.logstash:
+  hosts: ["logstash:5044"]
+  
+  # SSL/TLS CONFIGURATION STARTS HERE
+  ssl.enabled: true
+  
+  # This path matches what you put in docker-compose.yml
+  ssl.certificate_authorities: ["/etc/filebeat/certs/ca.crt"]
+  
+  # Option B: Resilient to IP changes/Wi-Fi switching
+  ssl.verification_mode: "certificate"
+
+logging.level: info
